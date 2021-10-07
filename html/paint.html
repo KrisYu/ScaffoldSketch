@@ -1,0 +1,1220 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>Drawing with Scaffolds</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<link type="text/css" rel="stylesheet" href="main.css">
+		<meta http-equiv="Cache-control" content="no-cache">
+	</head>
+	<body>
+
+		<div id="info">
+			Drawing with Scaffolds
+		</div>
+
+		<script src="./js/HelioWebXRPolyfill.js"></script>
+
+		<script type="module">
+
+			import * as THREE from './js/three.module.js';
+			import { GLTFExporter } from './js/GLTFExporter.js';
+			import { OrbitControls } from './js/OrbitControls.js';
+			import { TubePainter } from './js/TubePainter.js';
+			import { VRButton } from './js/VRButton.js';
+			import { BoxLineGeometry } from './js/BoxLineGeometry.js';
+			import { XRControllerModelFactory } from './js/XRControllerModelFactory.js';
+			import { WebSocketClient } from './js/websocket-client.js';
+
+
+			// for performance, use a single POINTS to draw all the points
+			var dotVertices, dotGeometry, dotMaterial, dot;
+
+			// for performance, use singe LineSegments to draw all shapes
+			var shapeVertices, shapeGeometry, shapeMaterial, shape;
+
+
+			var container;
+			var camera, scene, renderer;
+			var zoomable;
+
+			var controller1, controller2;
+			var controllerGrip1, controllerGrip2;
+
+			var scaffold_strokes, shape_strokes;
+
+			var room;
+
+			// pass cursor data to backend
+			var cursor = new THREE.Vector3();
+
+			var controls;
+
+			var socket;
+
+
+			// for instruction
+			var left_instruction_group, right_instruction_group;
+			let left_thumbstick_text_mesh, button_x_text_mesh;
+			let right_thumbstick_text_mesh, button_a_text_mesh;
+
+			let scaffold_mode_indicator, shape_mode_indicator;
+			let zoom_indicator;
+
+			let connected_text_mesh, export_text_mesh, undo_text_mesh, redo_text_mesh;
+			let hide_scaffold_text_mesh, show_scaffold_text_mesh;
+			let scaffold_label_text_mesh, shape_label_text_mesh;
+			let draw_label_text_mesh;
+
+			// draw mode
+			let draw_modes = ['construction-stroke', 'shape-stroke'];
+			var draw_mode_index = 0;
+
+			// show and hide scaffold lines
+			var show_scaffold = true;
+			var show_shape = true;
+
+			// remember start_point in scaffold mode
+			// so scaffold line can be elastic line 
+			var start_point;
+
+			// looks of the system
+			const CONFIG = {
+				'background':  0xE7E7E7, // white is all color
+				'room': 0x8A8A8A,
+				'pawn': 0x585858,
+				'pivot': 0x424242,
+				'curve': 0x000000, // black is 0
+				'scaffold': 0x3A3A3A, 
+				'text': 0x4D4C4C,
+				'scaffold_width' : 5,
+				'zoom_indicator': 0x3A3A3A,
+			};
+
+
+			init();
+			initWebSocket();
+			animate();
+
+			function init() {
+
+				container = document.createElement( 'div' );
+				document.body.appendChild( container );
+
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color( CONFIG['background'] );
+
+				camera = new THREE.PerspectiveCamera( 50, window.innerWidth / window.innerHeight, 0.01, 50 );
+				camera.position.set( 0, 1.6, 3 );
+
+
+				controls = new OrbitControls( camera, container );
+				controls.target.set( 0, 1.6, 0 );
+				controls.update();
+				
+				zoomable = new THREE.Group();
+				scene.add( zoomable );
+
+				room = new THREE.LineSegments(
+					new BoxLineGeometry( 6, 6, 6, 10, 10, 10 ),
+					new THREE.LineBasicMaterial( { color: CONFIG['room'] } )
+				);
+				room.geometry.translate( 0, 3, 0 );
+				zoomable.add( room );
+
+				// hide for user study
+				// https://threejs.org/docs/#api/en/helpers/AxesHelper
+				var axesHelper = new THREE.AxesHelper( 1 );
+				// zoomable.add( axesHelper );
+
+				zoomable.add( new THREE.HemisphereLight( 0x888877, 0x777788 ) );
+
+				var light = new THREE.DirectionalLight( 0xffffff, 0.5 );
+				light.position.set( 0, 4, 0 );
+				zoomable.add( light );
+
+				var painter1 = new TubePainter();
+				// painter1.setColor( 0xe0e0ff );
+				scene.add( painter1.mesh );
+
+				var painter2 = new TubePainter();
+				// painter2.setColor( 0xffe0ff );
+				scene.add( painter2.mesh );
+
+
+				// Make groups for the user's input
+				scaffold_strokes = new THREE.Group();
+				shape_strokes = new THREE.Group();
+				zoomable.add( scaffold_strokes );
+				zoomable.add( shape_strokes );
+
+				dotVertices = [];
+				dotGeometry = new THREE.BufferGeometry();
+				dotGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( dotVertices, 3 ) );
+				dotGeometry.setDrawRange( 0, dotVertices.length/3 );
+				dotMaterial = new THREE.PointsMaterial( { color: CONFIG['scaffold'], size: 6, sizeAttenuation: false } );
+				dot = new THREE.Points( dotGeometry, dotMaterial );
+				scaffold_strokes.add( dot );
+
+				shapeVertices = [];
+				shapeGeometry = new THREE.BufferGeometry();
+				shapeGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( shapeVertices, 3 ) );
+				shapeGeometry.setDrawRange( 0, shapeVertices.length/3 );
+				shapeMaterial = new THREE.LineBasicMaterial( { color: CONFIG['curve'], linewidth: 6} );
+				shape = new THREE.LineSegments( shapeGeometry, shapeMaterial );
+				shape_strokes.add( shape );
+
+
+				left_instruction_group = new THREE.Group();
+				right_instruction_group = new THREE.Group();
+
+				// renderer
+				renderer = new THREE.WebGLRenderer( { antialias: true } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.outputEncoding = THREE.sRGBEncoding;
+				renderer.xr.enabled = true;
+				container.appendChild( renderer.domElement );
+				document.body.appendChild( VRButton.createButton( renderer ) );
+
+				// controllers
+				function onSelectStart() {
+					this.userData.isSelecting = true;
+
+					// Tell the userData that we've finished.
+					if( this.userData.selectStart !== undefined ) this.userData.selectStart();
+				}
+
+				function onSelectEnd() {
+					this.userData.isSelecting = false;
+
+					// Tell the userData that we've finished.
+					if( this.userData.selectEnd !== undefined ) this.userData.selectEnd();
+				}
+
+
+				function onSqueezeStart() {
+
+					this.userData.isSqueezing = true;
+					this.userData.positionAtSqueezeStart = this.position.y;
+					this.userData.scaleAtSqueezeStart = this.scale.x;
+
+				}
+
+				function onSqueezeEnd() {
+
+					this.userData.isSqueezing = false;
+
+				}
+
+				function startStroke() {
+					let userData = this;
+					userData.active_stroke = [];
+				}
+
+				// submit stoke to Python side, make sure unzoomed data
+				function submitStroke() {
+					let userData = this;
+
+					// inverse of zoomable.transform
+					var position = zoomable.position;
+					var scale = zoomable.scale;
+
+					var M_1 = new THREE.Matrix4();
+					var M_2 = new THREE.Matrix4();
+
+					M_1.makeTranslation ( -position.x, -position.y, -position.z );
+					M_2.makeScale(1/scale.x, 1/scale.y, 1/scale.z);
+					
+					M_2.multiply(M_1);
+
+					// The passed to Python data is unzoomed data 
+					for (let index = 0; index < userData.active_stroke.length; index++) {
+						const stroke = userData.active_stroke[index];
+						stroke.applyMatrix4(M_2);
+					}
+
+					var json_data = {}
+
+					json_data["scale"] =  scale;
+					json_data["pts"] = userData.active_stroke ;
+
+					// console.log( JSON.stringify(json_data) );
+
+					if ( draw_modes[draw_mode_index] === 'shape-stroke' ) {
+						socket.send( "shape-stroke " + JSON.stringify(json_data) );
+					} 
+					else {
+						socket.send( "construction-stroke " + JSON.stringify(json_data)   );
+					}
+				}
+
+				controller1 = renderer.xr.getController( 0 );
+				controller1.addEventListener( 'selectstart', onSelectStart );
+				controller1.addEventListener( 'selectend', onSelectEnd );
+				controller1.addEventListener( 'squeezestart', onSqueezeStart );
+				controller1.addEventListener( 'squeezeend', onSqueezeEnd );
+
+				controller1.userData.painter = painter1;
+				controller1.userData.active_stroke = [];
+				controller1.userData.selectStart = startStroke;
+				controller1.userData.selectEnd = submitStroke;
+				scene.add( controller1 );
+
+				controller2 = renderer.xr.getController( 1 );
+				controller2.addEventListener( 'selectstart', onSelectStart );
+				controller2.addEventListener( 'selectend', onSelectEnd );
+				controller2.addEventListener( 'squeezestart', onSqueezeStart );
+				controller2.addEventListener( 'squeezeend', onSqueezeEnd );
+
+				controller2.userData.painter = painter2;
+				controller2.userData.selectStart = startStroke;
+				controller2.userData.selectEnd = submitStroke;
+				scene.add( controller2 );
+
+
+				controller2.addEventListener( 'connected', function( event ) {
+					controller2.userData.XRInputSource = event.data;
+					// console.log( 'controller2', controller2.userData.XRInputSource );
+				});
+
+				controller1.addEventListener( 'connected', function( event ) {
+					controller1.userData.XRInputSource = event.data;
+					// console.log( 'controller1', controller1.userData.XRInputSource );
+				});
+
+
+				// Add the pawn geometry for each controller.
+				// This is used in handleController() to set the cursor position.
+				/*
+				var geometry = new THREE.CylinderBufferGeometry( 0.01, 0.02, 0.07, 5 );
+				geometry.rotateX( - Math.PI / 2 );
+				var material = new THREE.MeshStandardMaterial( { color: CONFIG['pawn'], flatShading: true } );
+				var mesh = new THREE.Mesh( geometry, material );
+				*/
+				var mesh = new THREE.Group();
+				mesh.position.z = -0.02;
+
+				var pivot = new THREE.Mesh( new THREE.IcosahedronBufferGeometry( 0.01, 2 ) ,
+											new THREE.MeshBasicMaterial( { color : CONFIG['pivot'] } ) );
+				pivot.name = 'pivot';
+				pivot.position.z = -0.04;
+				mesh.add( pivot );
+
+				controller1.add( mesh.clone() );
+				controller2.add( mesh.clone() );
+
+
+
+				// The XRControllerModelFactory will automatically fetch controller models
+				// that match what the user is holding as closely as possible. The models
+				// should be attached to the object returned from getControllerGrip in
+				// order to match the orientation of the held device.
+
+				var controllerModelFactory = new XRControllerModelFactory();
+
+				controllerGrip1 = renderer.xr.getControllerGrip( 0 );
+				controllerGrip1.add( controllerModelFactory.createControllerModel( controllerGrip1 ) );
+				scene.add( controllerGrip1 );
+
+				controllerGrip2 = renderer.xr.getControllerGrip( 1 );
+				controllerGrip2.add( controllerModelFactory.createControllerModel( controllerGrip2 ) );
+				scene.add( controllerGrip2 );
+
+
+				// add straight line as scaffold_mode_indicator
+				const scaffold_mode_points = [];
+				scaffold_mode_points.push(new THREE.Vector3(0, 0.04, 0) );
+				scaffold_mode_points.push(new THREE.Vector3(0, 0.06, 0) );
+				const scaffold_indicator_geometry = new THREE.BufferGeometry().setFromPoints( scaffold_mode_points );
+				const scaffold_indicator_material = new THREE.LineBasicMaterial( { color: CONFIG['scaffold'], linewidth: 1} );
+
+				scaffold_mode_indicator = new THREE.Line( scaffold_indicator_geometry, scaffold_indicator_material );
+				scaffold_mode_indicator.name = "scaffold_mode_indicator";
+				scaffold_mode_indicator.position.z = -0.01;
+				scaffold_mode_indicator.position.x = -0.02;
+				scaffold_mode_indicator.rotateX( -Math.PI/2 );
+
+				// add sin curve as shape_mode_indicator
+				const shape_indicator_points = [];
+                for (let j = 0; j < Math.PI * 2; j += (2 * Math.PI) / 100) {
+                    shape_indicator_points.push( new THREE.Vector3(0.004 * Math.sin(j), 0.004 * j, 0) );
+                }
+				const shape_indicator_geometry = new THREE.BufferGeometry().setFromPoints( shape_indicator_points );
+				const shape_indicator_material = new THREE.LineBasicMaterial( { color: CONFIG['curve'], linewidth: 6 } );
+				
+                shape_mode_indicator = new THREE.Line( shape_indicator_geometry, shape_indicator_material);
+                shape_mode_indicator.name = "shape_mode_indicator";
+				shape_mode_indicator.position.z = -0.045;
+				shape_mode_indicator.position.x = -0.02;
+				shape_mode_indicator.rotateX( -Math.PI/2 );
+
+
+				// add sphere as zoom_indicator
+				let sphere_geometry = new THREE.SphereGeometry(0.032, 32, 32);
+				let sphere_material = new THREE.MeshBasicMaterial( {color: CONFIG['zoom_indicator'], opacity: 0.3, transparent: true} );
+				zoom_indicator = new THREE.Mesh( sphere_geometry, sphere_material );
+				zoom_indicator.name = "zoom_indicator";
+
+
+				// show text in vr world
+				var loader = new THREE.FontLoader();
+				loader.load( 'js/fonts/helvetiker_regular.typeface.json', function ( font ) {
+					var export_geometry = new THREE.TextGeometry( 'export successfully', {
+						font: font,
+						size: 0.03,
+						height: 0.001,
+					} );
+
+					var textMaterial = new THREE.MeshBasicMaterial({ color: CONFIG['text'] });
+
+					export_text_mesh = new THREE.Mesh( export_geometry, textMaterial );
+					export_text_mesh.name = 'export';
+
+
+					var undo_geometry = new THREE.TextGeometry( 'undo', {
+						font: font,
+						size: 0.02,
+						height: 0.001,
+					});
+
+					undo_text_mesh = new THREE.Mesh( undo_geometry, textMaterial );
+					undo_text_mesh.name = 'undo';
+
+
+					var redo_geometry = new THREE.TextGeometry( 'redo', {
+						font: font,
+						size: 0.02,
+						height: 0.001,
+					});
+
+					redo_text_mesh = new THREE.Mesh( redo_geometry, textMaterial );
+					redo_text_mesh.name = 'redo';
+
+
+					var hide_scaffold_geometry = new THREE.TextGeometry( 'hide scaffold', {
+						font: font,
+						size: 0.02,
+						height: 0.001,
+					});
+
+					hide_scaffold_text_mesh = new THREE.Mesh( hide_scaffold_geometry, textMaterial);
+					hide_scaffold_text_mesh.name = 'hide_scaffold_text';
+
+					var show_scaffold_geometry = new THREE.TextGeometry( 'show scaffold', {
+						font: font,
+						size: 0.02,
+						height: 0.001,
+					});
+
+					show_scaffold_text_mesh = new THREE.Mesh( show_scaffold_geometry, textMaterial);
+					show_scaffold_text_mesh.name = 'show_scaffold_text';
+
+					var scaffold_label_geometry = new THREE.TextGeometry( 'scaffold', {
+						font: font,
+						size: 0.01,
+						height: 0.001,
+					});
+
+
+					scaffold_label_text_mesh = new THREE.Mesh( scaffold_label_geometry, textMaterial);
+					scaffold_label_text_mesh.name = 'scaffold_label';
+					scaffold_label_text_mesh.position.z = -0.055;
+					scaffold_label_text_mesh.position.x = -0.08;
+					scaffold_label_text_mesh.rotateX( -Math.PI/2 );
+
+					var shape_label_geometry = new THREE.TextGeometry( 'shape', {
+						font: font,
+						size: 0.01,
+						height: 0.001,
+					});
+
+					shape_label_text_mesh = new THREE.Mesh( shape_label_geometry, textMaterial);
+					shape_label_text_mesh.name = 'shape_label';
+					shape_label_text_mesh.position.z = -0.055;
+					shape_label_text_mesh.position.x = -0.07;
+					shape_label_text_mesh.rotateX( -Math.PI/2 );
+
+
+					var draw_label_geometry = new THREE.TextGeometry(' Draw', {
+						font: font,
+						size: 0.01,
+						height: 0.001,
+					});
+
+					draw_label_text_mesh = new THREE.Mesh( draw_label_geometry, textMaterial);
+					draw_label_text_mesh.position.y = -0.02;
+					draw_label_text_mesh.position.x = -0.02;
+					draw_label_text_mesh.rotateX( - Math.PI/2 );
+					right_instruction_group.add( draw_label_text_mesh );
+
+					var left_thumbstick_geometry = new THREE.TextGeometry('           <-> \n zoom in/zoom out', {
+						font: font,
+						size: 0.005,  
+						height: 0.0005,
+					});
+
+					left_thumbstick_text_mesh = new THREE.Mesh( left_thumbstick_geometry, textMaterial );
+					left_thumbstick_text_mesh.position.x = -0.03;
+					left_thumbstick_text_mesh.position.y = 0.02;
+					left_thumbstick_text_mesh.position.z = 0.03;
+					left_thumbstick_text_mesh.rotateX( - Math.PI/2 );
+
+					var button_x_geometry = new THREE.TextGeometry('X: export', {
+						font: font,
+						size: 0.005,  
+						height: 0.0005,
+					});
+
+					button_x_text_mesh = new THREE.Mesh( button_x_geometry, textMaterial );					
+					button_x_text_mesh.position.x = -0.02;
+					button_x_text_mesh.position.y = 0.02;
+					button_x_text_mesh.position.z = 0.05;		
+					button_x_text_mesh.rotateX( - Math.PI/2 );
+
+					left_instruction_group.add( left_thumbstick_text_mesh );
+					left_instruction_group.add( button_x_text_mesh );
+
+
+					var right_thumbstick_geometry = new THREE.TextGeometry('     <-> \n undo/redo', {
+						font: font,
+						size: 0.005,  
+						height: 0.0005,
+					});
+
+					right_thumbstick_text_mesh = new THREE.Mesh( right_thumbstick_geometry, textMaterial );
+					right_thumbstick_text_mesh.rotateX( - Math.PI/2 );
+					right_thumbstick_text_mesh.position.x = 0.00;
+					right_thumbstick_text_mesh.position.y = 0.02;
+					right_thumbstick_text_mesh.position.z = 0.03;
+
+					var button_a_geometry = new THREE.TextGeometry('B: hide/show scaffold \n A: scaffold/shape', {
+						font: font,
+						size: 0.005,  
+						height: 0.0005,
+					});
+
+					button_a_text_mesh = new THREE.Mesh( button_a_geometry, textMaterial );					
+					button_a_text_mesh.position.x = -0.02;
+					button_a_text_mesh.position.y = 0.02;
+					button_a_text_mesh.position.z = 0.05;		
+					button_a_text_mesh.rotateX( - Math.PI/2 );
+
+					right_instruction_group.add( right_thumbstick_text_mesh );
+					right_instruction_group.add( button_a_text_mesh );
+
+
+					var connected_geometry = new THREE.TextGeometry('connected paint_server',{
+						font: font,
+						size: 0.1,
+						height: 0.01,
+					});
+		
+					connected_text_mesh = new THREE.Mesh( connected_geometry, textMaterial );
+					connected_text_mesh.name = 'connected';
+					connected_text_mesh.position.x = -0.7;
+					connected_text_mesh.position.y = 2.5;
+				} );
+
+				window.addEventListener( 'resize', onWindowResize, false );
+
+			}
+
+
+			async function initWebSocket() {
+                // Let's use WebSocketClient library, which supports await: https://github.com/jcao219/websocket-async
+                // Write a websockets server using: http://websockets.readthedocs.io/en/stable/intro.html
+                socket = new WebSocketClient;
+
+                // Socket from URL in modern JavaScript: https://stackoverflow.com/questions/979975/how-to-get-the-value-from-the-get-parameters
+                var url = new URL( window.location.href );
+                var port = 9000;
+                if( url.searchParams.has("port") ) {
+                    port = parseInt( url.searchParams.get("port") );
+                }
+
+                await socket.connect('wss://' + location.hostname + ':' + port);
+				console.log( "Connected on port " + port + ": ", socket.connected );
+
+				// Send load-state if we load from existing state
+				socket.send("load-state ");
+				
+                // To simulate an .onmessage() callback:
+                // TODO Q: What happens if you call socket.disconnect() and socket.connect() during an await?
+                while( true ) {
+                    const msg = await socket.receive();
+
+					var cmd = msg.substr(0,msg.indexOf(' '));
+
+					// do not parse payload for undo
+
+					var payload = JSON.parse( msg.substr(msg.indexOf(' ')+1) );
+
+                    // process the msg
+					if( cmd == "new-straight-line" ) {
+
+						// clear the drawing
+
+						// get the painter and clear the drawing of painter
+						// do not know whether it is good practice here.
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						// set the line empty because we'll draw the actually line
+						var line = draw_line( payload );
+						scaffold_strokes.add( line );
+						
+
+						// also render the points
+						add_line_points( payload );
+
+						dotGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( dotVertices, 3 ) );
+						dotGeometry.setDrawRange( 0, dotVertices.length/3 );
+                		dotGeometry.attributes.position.needsUpdate = true;
+						dotGeometry.computeBoundingBox();
+						dotGeometry.computeBoundingSphere();
+						
+
+						// console.log( dot.geometry.getAttribute('position') );
+						// console.log( dot.geometry.getAttribute('position').array );
+					
+						renderer.render( scene, camera );
+
+					} 
+					else if (cmd == "new-point") {
+						
+						// get the painter and clear the drawing of painter
+						// do not know whether it is good practice here.
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						// draw point
+						dotVertices.push( payload[0], payload[1], payload[2] );
+						dotGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( dotVertices, 3 ) );
+						dotGeometry.setDrawRange( 0, dotVertices.length/3 );
+                		dotGeometry.attributes.position.needsUpdate = true;
+						dotGeometry.computeBoundingBox();
+						dotGeometry.computeBoundingSphere();
+
+						renderer.render( scene, camera );
+						
+					}
+					else if( cmd == "new-shape-line" ) {
+
+						// get the painter and clear the drawing of painter
+						// do not know whether it is good practice here.
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						// add shape curve points
+						add_shape_curve( payload );
+
+
+						shapeGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( shapeVertices, 3 ) );
+						shapeGeometry.setDrawRange( 0, shapeVertices.length/3 );
+                		shapeGeometry.attributes.position.needsUpdate = true;
+						shapeGeometry.computeBoundingBox(); // ?  do I need this
+						shapeGeometry.computeBoundingSphere(); // ?  do I need this
+					}
+					else if ( cmd == "load-state" ){
+						console.log("load from exising state file" );
+						set_from_state( payload );
+						console.log( scaffold_strokes );
+						console.log( shape_strokes );
+
+					}
+					else if ( cmd === "undo" ) {
+
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						console.log("undo", payload );
+						set_from_state( payload );
+											
+					}
+					else if ( cmd === "redo" ) {
+						console.log("redo", payload );
+	
+						// // https://stackoverflow.com/questions/313893/how-to-measure-time-taken-by-a-function-to-execute
+						// var t0 = performance.now();
+						set_from_state( payload );	
+						// var t1 = performance.now();
+						// console.log("Redo call to set_from_state took " + (t1 - t0) + " milliseconds.");	
+					}					
+					else {
+						console.error( "Unknown message:", msg );
+					}
+
+                }
+
+            }
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+
+			function remove_children_of_group( group ) {
+				for( var i = group.children.length - 1; i >= 0; i--) { 
+					group.remove( group.children[i] );
+				}
+			}
+
+
+			// draw everything from state
+			function set_from_state( state ){
+				console.log( 'set_from_state function being called ');
+				
+				// clear everything
+				remove_children_of_group( scaffold_strokes );
+				remove_children_of_group( shape_strokes );
+
+
+				// add from state
+				for (const property in state) {
+					
+					if ( property === "lines" ) {
+						for (let index = 0; index < state[property].length; index++) {
+							const line = state[property][index];
+							const res = draw_line( line );
+							scaffold_strokes.add( res );
+						}
+					}
+					if ( property === "points") {
+						
+						dotVertices = [];
+
+                        for (let index = 0; index < state[property].length; index++) {
+                         const point = state[property][index];
+                         dotVertices.push( point[0], point[1], point[2]);
+                        }
+
+						dotGeometry = new THREE.BufferGeometry();
+						dotGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( dotVertices, 3 ) );
+						dotGeometry.setDrawRange( 0, dotVertices.length/3 );
+                		dotGeometry.attributes.position.needsUpdate = true;
+						dotMaterial = new THREE.PointsMaterial( { color: CONFIG['scaffold'], size: 6, sizeAttenuation: false } );
+
+						dot = new THREE.Points( dotGeometry, dotMaterial );
+
+						// because we clean everything begining this function
+						scaffold_strokes.add( dot );
+					}
+					if ( property === "curves" ) {
+						
+						shapeVertices = [];
+
+						for (let index = 0; index < state[property].length; index++) {
+							const curve = state[property][index];
+							add_shape_curve( curve );
+							
+						}
+
+						// console.log( shapeVertices );
+						shapeGeometry = new THREE.BufferGeometry();
+						shapeGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( shapeVertices, 3 ) );
+						shapeGeometry.setDrawRange( 0, shapeVertices.length/3 );
+						shapeMaterial = new THREE.LineBasicMaterial( { color: CONFIG['curve'], linewidth: 6} );
+						shape = new THREE.LineSegments( shapeGeometry, shapeMaterial );
+
+						// because we clean everything begining this function
+						shape_strokes.add( shape );
+					}
+				}
+
+				// render 
+				renderer.render( scene, camera );
+			}
+
+
+
+			// add points to dotVertices
+			function add_line_points( payload ){
+
+				if ( payload.length < 2) {
+					return;
+				}
+
+				var pt_0 = payload[0];
+				var pt_1 = payload[1];
+
+				// add the points to dotVertices, we'll use them to draw points
+				dotVertices.push( pt_0[0], pt_0[1], pt_0[2] );
+				dotVertices.push( pt_1[0], pt_1[1], pt_1[2] );
+				dotVertices.push( (pt_0[0] + pt_1[0])/2.0,(pt_0[1] + pt_1[1])/2.0,(pt_0[2] + pt_1[2])/2.0 );
+			}
+
+
+			function draw_line( payload ) {
+
+				if ( payload.length < 2) {
+					return;
+				}
+
+				var points = [];
+
+				// should be 2 points
+				var pt_0 = payload[0];
+				var point_0 = new THREE.Vector3(pt_0[0], pt_0[1], pt_0[2]);
+				var pt_1 = payload[1];
+				var point_1 = new THREE.Vector3(pt_1[0], pt_1[1], pt_1[2]);
+
+				points.push( point_0 );
+				points.push( point_1 );
+
+				var geometry = new THREE.BufferGeometry().setFromPoints( points );
+				var material = new THREE.LineBasicMaterial( { color: CONFIG['scaffold'], linewidth: 1} );
+				var line = new THREE.Line( geometry, material );
+
+				return line ;
+			}
+
+
+			// add shape curve
+			function add_shape_curve( payload ) {
+
+				if ( payload.length < 2) {
+					return;
+				}
+
+				// startpoint
+				var pt0 = payload[0];
+				shapeVertices.push( pt0[0], pt0[1], pt0[2] );
+
+				for (let index = 1; index < payload.length - 1; index++) {
+					var pt = payload[index];
+					shapeVertices.push(pt[0], pt[1], pt[2]);
+					shapeVertices.push(pt[0], pt[1], pt[2]);
+				}
+
+				// endpoint
+				var pt1 = payload[ payload.length - 1 ];
+				shapeVertices.push( pt1[0], pt1[1], pt1[2] );
+			}
+
+			function stroke_group_visible( scaffold_strokes, visible) {
+				scaffold_strokes.traverse ( function (child) {
+					child.visible = visible;
+				});
+			}
+
+			function clone_gamepad( gamepad ) {
+                // There are a few ways to clone an object or array in javascript.
+                // From: https://stackoverflow.com/questions/122102/what-is-the-most-efficient-way-to-deep-clone-an-object-in-javascript
+                // From: https://stackoverflow.com/questions/3978492/fastest-way-to-duplicate-an-array-in-javascript-slice-vs-for-loop
+
+                // The simplest way:
+                // return JSON.parse(JSON.stringify(gamepad));
+
+
+                // A more complex way:
+                // Use the spread operator to make a shallow copy of gamepad.
+                let result = {...gamepad};
+                // gamepad contains two arrays. Copy them with their own spread operators.
+                result.axes = [];
+                result.buttons = [];
+
+				for (let index = 0; index < gamepad.axes.length; index++) {
+					result.axes.push( gamepad.axes[index] );
+				}
+
+				for (let index = 0; index < gamepad.buttons.length; index++) {
+					var button_copy = {};
+					button_copy.pressed = gamepad.buttons[index].pressed;
+					button_copy.touched = gamepad.buttons[index].touched;
+					button_copy.value = gamepad.buttons[index].value;
+
+					result.buttons.push( button_copy );
+				}
+
+                return result;
+			}
+
+
+			function handleController( controller ) {
+
+				var userData = controller.userData;
+				var painter = userData.painter;
+				var XRInputSource = userData.XRInputSource;
+                // Get last frame's gamepad for this controller.
+                let previous_gamepad = userData.previous_gamepad; // will be undefined for the very first frame.
+
+                if( XRInputSource !== undefined && XRInputSource.gamepad !== undefined ) {
+                    // Clone the current gamepad for the next time handleController( controller ) is called.
+                    // WARNING: Don't access userData.previous_gamepad in this function, because we've
+                    //          already updated it to the current values. Instead, use the local variable
+                    //          `previous_gamePad` created a few lines up.
+                    userData.previous_gamepad = clone_gamepad( XRInputSource.gamepad );
+                }
+
+
+				// console.log(XRInputSource);
+
+				// https://www.w3.org/TR/webxr-gamepads-module-1/
+
+				// If I do console.log(XRInputSource), it is undefined at the begining.
+				// that's why check the existence of it
+				if (XRInputSource && XRInputSource.handedness === "left") {
+
+					controller.add( zoom_indicator );
+					
+					// show instruction_group when move the controller close to head
+					const head_position = new THREE.Vector3();
+					head_position.setFromMatrixPosition( camera.matrixWorld );
+
+					if (head_position.distanceTo(controller.position) < 0.3 ) {
+						controller.add( left_instruction_group );
+					} else {
+						controller.remove( left_instruction_group );
+					}
+
+
+					// 'X' button: export
+					if (XRInputSource.gamepad.buttons[4].pressed && !previous_gamepad.buttons[4].pressed ) {
+						
+						console.log("left X button pressed, export");
+						
+						// gltf export
+						var gltfExporter = new GLTFExporter();
+						// create a new scene to store only the curve stroke
+						var export_scene = new THREE.Scene();
+
+						if (show_shape) {
+							export_scene.add( shape_strokes.clone() );
+						}
+
+						if (show_scaffold) {
+							export_scene.add( scaffold_strokes.clone() );
+						}
+
+						// Parse the input and generate the glTF output
+						gltfExporter.parse( export_scene, function ( gltf ) {
+							var output = JSON.stringify( gltf );
+							socket.send('export ' + output );
+							
+							// show export font 
+							controller.add( export_text_mesh );
+							export_text_mesh.position.x = -0.3;
+							export_text_mesh.position.z = -0.07;
+							
+							// hide it after 2 seconds
+							setTimeout(function(){ controller.remove( export_text_mesh ) }, 1000);
+						} );
+					}
+
+					// 'Y' button : show/hide shape strokes
+					if (XRInputSource.gamepad.buttons[5].pressed && !previous_gamepad.buttons[5].pressed) {
+						console.log("left Y button pressed, hide curve");
+
+						if (show_shape === true) {
+							show_shape = false;
+							stroke_group_visible( shape_strokes, false );
+						} else {
+							show_shape = true;
+							stroke_group_visible( shape_strokes, true );
+						}
+
+					}
+
+					// thumbstick pushed left: zoom out 
+					if ( XRInputSource.gamepad.axes[2] < 0 ) {
+						console.log('XRInputSource.gamepad.axes[2] pushed left');
+						zoom_out();
+
+					}
+
+					// thumbstick pushed right: zoom in
+					if ( XRInputSource.gamepad.axes[2] > 0 ) {
+						console.log('left controller joystick pushed right, zoom in ');	
+						zoom_in();
+					}
+
+					function zoom_in(){
+						
+						/// Create the matrix M that does this:
+						/// Step 1: translate by -XRInputSource.gamepad.position
+						/// Step 2: scale by 1.001
+						/// Step 3: translate by XRInputSource.gamepad.position
+						/// scaffold_strokes.applyMatrix4( M )
+
+						var controller_position = controller.position;
+
+						var M_1 = new THREE.Matrix4();
+						var M_2 = new THREE.Matrix4();
+						var M_3 = new THREE.Matrix4();
+
+						const SPEED = 1.005;
+						M_1.makeTranslation ( -controller_position.x, -controller_position.y, -controller_position.z );
+						M_2.makeScale(SPEED, SPEED, SPEED);
+						M_3.makeTranslation( controller_position.x, controller_position.y, controller_position.z );
+
+						zoom_indicator.applyMatrix4( M_2 );
+
+						M_2.multiply(M_1);
+						M_3.multiply(M_2);
+
+
+						zoomable.applyMatrix4( M_3 );
+						
+					}
+					
+
+					
+					function zoom_out(){
+    				    
+						var position = zoomable.position;
+						var scale = zoomable.scale;
+
+						var M_1 = new THREE.Matrix4();
+						var M_2 = new THREE.Matrix4();
+
+						const STEP = .05;
+						M_1.makeTranslation ( -STEP*position.x, -STEP*position.y, -STEP*position.z );
+						M_2.makeScale( Math.pow( 1/scale.x, STEP ), Math.pow( 1/scale.y, STEP ), Math.pow( 1/scale.z, STEP ) );
+						
+						zoom_indicator.applyMatrix4( M_2 );
+						M_2.multiply(M_1);
+
+						zoomable.applyMatrix4( M_2 );
+						
+					}
+
+
+				}
+
+
+				if (XRInputSource && XRInputSource.handedness === "right") {
+
+
+					if (right_instruction_group.getObjectByName('shape_label') !== undefined ) {
+						right_instruction_group.remove( shape_label_text_mesh) ;
+					}
+					if (right_instruction_group.getObjectByName('scaffold_label') !== undefined) {
+						right_instruction_group.remove( scaffold_label_text_mesh ) ;
+					}
+					// add the mode text to instruction group
+					// scaffold mode
+					if (draw_mode_index === 0) {
+						right_instruction_group.add( scaffold_label_text_mesh );
+					} else{
+						right_instruction_group.add( shape_label_text_mesh );
+					}
+
+
+
+					// show instruction_group when move the controller close to head
+					const head_position = new THREE.Vector3();
+					head_position.setFromMatrixPosition( camera.matrixWorld );
+
+					if (head_position.distanceTo(controller.position) < 0.3) {
+						controller.add( right_instruction_group );
+					} else {
+						controller.remove( right_instruction_group );
+					}
+
+					// depend on current mode, show indicator
+					if (draw_modes[draw_mode_index] === 'shape-stroke') {					 
+						// remove scaffold_mode_indicator
+						if (controller.getObjectByName('shape_mode_indicator') !== undefined) {
+							controller.remove( scaffold_mode_indicator );
+							controller.remove( scaffold_label_text_mesh );
+						}
+						// add the shape_mode_indicator to right controller
+						controller.add( shape_mode_indicator );	
+					} else {
+						// depend on current mode, show indicator 
+						if (controller.getObjectByName('shape_mode_indicator') !== undefined ) {
+							controller.remove( shape_mode_indicator );
+						}
+						controller.add( scaffold_mode_indicator );
+					}
+
+					// axes[2] push left: undo
+					// https://www.w3.org/TR/webxr-gamepads-module-1/#xr-standard-gamepad-mapping
+					if ( XRInputSource.gamepad.axes[2] < 0 && previous_gamepad.axes[2] === 0) {
+						console.log('undo from right controller axes');
+						socket.send("undo ");
+					}
+
+					// show undo text 
+					if ( XRInputSource.gamepad.axes[2] < 0 ) {
+						if (controller.getObjectByName('undo') === undefined) {
+							controller.add( undo_text_mesh );
+							undo_text_mesh.position.x = -0.02;
+							undo_text_mesh.position.z = -0.07;
+						}
+					}
+
+					if (XRInputSource.gamepad.axes[2] === 0 ) {
+						if (controller.getObjectByName('undo') !== undefined ) {
+							controller.remove( undo_text_mesh );
+						}
+					}
+					
+					// axes[3] push right: redo
+					if ( XRInputSource.gamepad.axes[2] > 0 && previous_gamepad.axes[2] === 0) {
+						console.log('redo from right controller axes');
+						socket.send("redo ");
+					}
+
+
+					// show redo text 
+					if ( XRInputSource.gamepad.axes[2] > 0 ) {
+						if (controller.getObjectByName('redo') === undefined) {
+							controller.add( redo_text_mesh );
+							redo_text_mesh.position.x = -0.02;
+							redo_text_mesh.position.z = -0.07;
+						}
+					}
+
+					if (XRInputSource.gamepad.axes[2] === 0 ) {
+						if (controller.getObjectByName('redo') !== undefined) {
+							controller.remove( redo_text_mesh );
+						}
+					}
+	
+					// 'A' button: switch draw mode
+					if ( XRInputSource.gamepad.buttons[4].pressed && !previous_gamepad.buttons[4].pressed ) {
+						console.log('right A button pressed, draw mode switch');
+
+						if (draw_mode_index === 0) {
+							// now we begin to draw shape
+							draw_mode_index = 1;
+						} 
+						else  {
+							// now we back to draw line and point
+							draw_mode_index = 0; 
+						}
+
+						console.log('switched to', draw_modes[draw_mode_index]);
+					}
+
+					// 'B' button: show/hide scaffold
+					if ( XRInputSource.gamepad.buttons[5].pressed && !previous_gamepad.buttons[5].pressed ) {
+						console.log("right B button pressed, show/hide scaffold ");
+						
+						if (show_scaffold === true) {
+							show_scaffold = false;
+							stroke_group_visible( scaffold_strokes, false );
+
+
+							// 
+							if (controller.getObjectByName('show_scaffold_text') !== undefined ) {
+								controller.remove( show_scaffold_text_mesh );
+							}
+
+							// hide scaffold 
+							controller.add( hide_scaffold_text_mesh );
+							hide_scaffold_text_mesh.position.x = -0.04;
+							hide_scaffold_text_mesh.position.z = -0.08;
+
+							// hide it after 2 seconds
+							setTimeout(function(){ controller.remove( hide_scaffold_text_mesh ) }, 1000);
+						} else {
+							show_scaffold = true;
+							stroke_group_visible( scaffold_strokes, true );
+							
+							// 
+							if (controller.getObjectByName('hide_scaffold_text') !== undefined ) {
+								controller.remove( hide_scaffold_text_mesh );
+							}
+
+							// show scaffold 
+							controller.add( show_scaffold_text_mesh );
+							show_scaffold_text_mesh.position.x = -0.04;
+							show_scaffold_text_mesh.position.z = -0.08;
+
+							// hide it after 2 seconds
+							setTimeout(function(){ controller.remove( show_scaffold_text_mesh ) }, 1000);				
+						}
+
+					}
+
+				}
+
+
+				
+				// draw curve stroke
+				if ( draw_modes[draw_mode_index] === 'shape-stroke') {
+					
+
+					painter.setColor( CONFIG['curve'] );
+					painter.setSize( 0.25 );
+					
+					var pivot = controller.getObjectByName( 'pivot' );
+
+					cursor.setFromMatrixPosition( pivot.matrixWorld );
+
+					if ( userData.isSelecting === true ) {
+
+						painter.lineTo( cursor );
+						painter.update();
+
+						userData.active_stroke.push( cursor.clone() );
+					
+					} else {
+
+						painter.moveTo( cursor );
+					}
+				} 
+				// draw scaffold line 
+				else 
+				{
+
+					painter.setColor( CONFIG['scaffold'] );
+					painter.setSize( 0.1 );
+
+					var pivot = controller.getObjectByName( 'pivot' );
+					cursor.setFromMatrixPosition( pivot.matrixWorld );
+
+					if (XRInputSource && XRInputSource.gamepad.buttons[0].pressed && !previous_gamepad.buttons[0].pressed) {
+						start_point = cursor.clone();
+					}
+
+					if ( userData.isSelecting === true ) {
+
+
+						painter.clear();
+
+						painter.moveTo( start_point );
+						painter.lineTo( cursor.clone() );
+						painter.update();
+						
+
+						userData.active_stroke = [ start_point, cursor.clone() ];
+					} else {
+						painter.moveTo( cursor );
+					}
+
+
+				}
+
+
+			}
+
+			function animate() {
+
+				renderer.setAnimationLoop( render );
+
+			}
+
+			function render() {
+
+				handleController( controller1 );
+				handleController( controller2 );
+
+				renderer.render( scene, camera );
+
+			}
+
+
+
+
+		</script>
+	</body>
+</html>

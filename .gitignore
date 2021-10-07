@@ -1,0 +1,7 @@
+*.pyo
+*.pyc
+__pycache__
+.DS_Store
+.polyscope.ini
+imgui.ini
+
